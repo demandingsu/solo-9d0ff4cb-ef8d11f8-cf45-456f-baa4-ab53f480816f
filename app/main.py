@@ -6,6 +6,7 @@
 * ``PATCH /inspections/{id}``              更正总片数/备注（与已有计数冲突则拒收）
 * ``POST /inspections/{id}/reports``       分次提交厚度区间计数（整份原子接收或拒收）
 * ``GET  /inspections/{id}/reports``       查看补报历史
+* ``POST /archives``                       漏填批号计数表的整组归档试算与入库
 * ``GET  /inspections/{id}/bounds``        给定合格区间，查询合格片数最少/最多
 * ``GET  /health``                         健康检查
 
@@ -18,10 +19,21 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from sqlite3 import Connection
 
 from . import db
+from .archiving import (
+    ArchiveBasisChanged,
+    CandidateMissing,
+    commit_archiving,
+    plan_archiving,
+)
 from .schemas import (
+    ArchiveAssignmentOut,
+    ArchiveOut,
+    ArchiveRequest,
+    ArchivedSheetOut,
     BoundsOut,
     CountReportIn,
     CountReportOut,
@@ -231,6 +243,116 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ) -> list[CountReportOut]:
         _require_inspection(connection, inspection_id)
         return [CountReportOut(**r) for r in db.get_reports(connection, inspection_id)]
+
+    @api.post(
+        "/archives",
+        response_model=ArchiveOut,
+        responses={
+            201: {"model": ArchiveOut, "description": "唯一归属，整组已入库"},
+            200: {"model": ArchiveOut, "description": "无解或多解，均未入库"},
+            404: {"description": "候选质检号不存在"},
+            409: {"description": "写入时候选批依据已变化，整组退回"},
+        },
+        tags=["归档"],
+        summary="漏填批号计数表的整组归档试算与入库",
+        description=(
+            "接收 1～6 张计数表（区间计数格式与补报相同）和 2～4 个候选质检号。"
+            "每张表只能归一个候选批，同批可收多张；同批多表先合并，再与该批"
+            "总片数和已收补报核对。整组只有一种相容归属时才一次入库，按表返回"
+            "质检号与补报号；无解返回 no_solution，多解返回两套不同的完整归属"
+            "方案（alternatives），两种情况都不入库。试算为只读、不加写锁，"
+            "期间补报与更正总片数可继续；写入时重新核对所有候选批，任一批的"
+            "总片数或已收计数与试算依据不符、或写入失败，整组退回（409）。"
+        ),
+    )
+    def archive_sheets(
+        payload: ArchiveRequest, connection: Connection = Depends(get_conn)
+    ) -> JSONResponse:
+        sheets = [
+            [(s.lo, s.hi, s.count) for s in sheet.segments] for sheet in payload.sheets
+        ]
+        candidate_ids = list(payload.candidate_ids)
+
+        try:
+            plan = plan_archiving(connection, sheets, candidate_ids)
+        except CandidateMissing as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"候选质检号 {exc.inspection_id} 不存在，未做任何写入",
+            ) from exc
+
+        def _assignment_out(assignment) -> ArchiveAssignmentOut:
+            return ArchiveAssignmentOut(
+                sheets=[
+                    ArchivedSheetOut(
+                        sheet_index=position,
+                        inspection_id=candidate_ids[candidate_index],
+                        # 备选方案未入库，没有补报号。
+                        report_id=None,
+                    )
+                    for position, candidate_index in enumerate(assignment)
+                ]
+            )
+
+        feasible = plan.feasible_assignments
+        if not feasible:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=ArchiveOut(
+                    status="no_solution",
+                    message=(
+                        "无解：候选批中不存在能同时容纳全部计数表的完整归属，"
+                        "整组未入库"
+                    ),
+                ).model_dump(),
+            )
+        if len(feasible) > 1:
+            # 枚举按字典序返回，前两套天然不同。
+            alternatives = [_assignment_out(feasible[0]), _assignment_out(feasible[1])]
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content=ArchiveOut(
+                    status="multiple",
+                    message=(
+                        f"存在 {len(feasible)} 套相容归属，未入库；"
+                        "以下给出两套不同的完整方案，请交班员查表确认"
+                    ),
+                    alternatives=alternatives,
+                ).model_dump(),
+            )
+
+        assignment = feasible[0]
+        try:
+            report_ids = commit_archiving(
+                connection, sheets, candidate_ids, plan.snapshots, assignment
+            )
+        except ArchiveBasisChanged as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"试算期间候选批 {exc.inspection_id} 的总片数或已收计数发生变化，"
+                    "与试算依据不符，整组退回、未入库；请重新试算"
+                ),
+            ) from exc
+
+        archived = [
+            ArchivedSheetOut(
+                sheet_index=position,
+                inspection_id=candidate_ids[candidate_index],
+                report_id=report_id,
+            )
+            for position, (candidate_index, report_id) in enumerate(
+                zip(assignment, report_ids)
+            )
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content=ArchiveOut(
+                status="archived",
+                message="唯一归属，整组已按表入库，每份计数表对应一个补报号",
+                sheets=archived,
+            ).model_dump(),
+        )
 
     @api.get(
         "/inspections/{inspection_id}/bounds",
